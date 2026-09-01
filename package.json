@@ -1,0 +1,13 @@
+{
+  "name": "staybid-japan",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "test": "node test/test-checkout.js && node test/test-webhook.js && node test/test-thumbnail.js"
+  },
+  "dependencies": {
+    "stripe": "^18.4.0",
+    "@supabase/supabase-js": "^2.45.0"
+  }
+}

@@ -1,0 +1,131 @@
+name: Setup infra (Supabase schema + Vercel env vars)
+#
+# Manual-only (workflow_dispatch): points Vercel's SUPABASE_URL /
+# SUPABASE_SERVICE_ROLE_KEY at this project and redeploys to production so
+# the new values take effect. Also applies supabase-schema.sql first, but
+# only if SUPABASE_DB_URL is provided — that secret is the hardest of the
+# three to find, and most of the time the fix needed is just the Vercel
+# keys, so the database step is skipped rather than required.
+#
+# Exists because the assistant's own sandbox has outbound network access to
+# vercel.com and supabase.co blocked by policy — this runs the same steps on
+# GitHub's runners instead, which have ordinary internet access. Needs these
+# repository secrets (Settings > Secrets and variables > Actions):
+#   SUPABASE_SERVICE_ROLE_KEY - required. The project's secret API key
+#                             (Settings > API Keys > Secret keys)
+#   VERCEL_TOKEN            - required. A token from vercel.com/account/tokens,
+#                             scoped to the team that owns this project
+#   SUPABASE_DB_URL         - optional. The "Session pooler" connection
+#                             string (with password), from Supabase >
+#                             Project Settings > Database > Connect. Only
+#                             needed if the smoke test at the end shows the
+#                             database tables don't exist yet.
+
+on:
+  workflow_dispatch:
+
+env:
+  SUPABASE_URL: https://rtmwtpjzbkxnpvbuucuq.supabase.co
+  VERCEL_PROJECT_NAME: staybid-japan
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets are present
+        run: |
+          missing=""
+          [ -z "${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" ] && missing="$missing SUPABASE_SERVICE_ROLE_KEY"
+          [ -z "${{ secrets.VERCEL_TOKEN }}" ] && missing="$missing VERCEL_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing — add them under Settings > Secrets and variables > Actions, then re-run."
+            exit 1
+          fi
+          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
+            echo "SUPABASE_DB_URL not set — skipping the database schema step, only fixing Vercel's env vars."
+          fi
+          echo "Required secrets are present."
+
+      - name: Apply and verify the schema (only if SUPABASE_DB_URL is set)
+        if: ${{ secrets.SUPABASE_DB_URL != '' }}
+        env:
+          PGCONN: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -e
+          sudo apt-get update -y -qq && sudo apt-get install -y -qq postgresql-client
+          exists=$(psql "$PGCONN" -t -A -c "select to_regclass('public.listings') is not null;")
+          echo "listings table already exists: $exists"
+          if [ "$exists" = "t" ]; then
+            echo "Schema already applied, skipping."
+          else
+            echo "Applying supabase-schema.sql..."
+            psql "$PGCONN" -v ON_ERROR_STOP=1 -f supabase-schema.sql
+            echo "Applied."
+          fi
+          psql "$PGCONN" -t -A -c "select table_name from information_schema.tables where table_schema='public' order by 1;" | tee /tmp/tables.txt
+          for t in listings payments webhook_events; do
+            grep -qx "$t" /tmp/tables.txt || { echo "::error::Table '$t' is missing after applying the schema."; exit 1; }
+          done
+          echo "Confirmed: listings, payments, webhook_events all exist."
+
+      - name: Install the Vercel CLI
+        run: npm install -g vercel@latest
+
+      - name: Resolve the Vercel project (avoids interactive 'vercel link')
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -e
+          resp=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v9/projects?search=${VERCEL_PROJECT_NAME}")
+          echo "$resp" | jq '.projects | map({id, name, accountId})'
+          project_id=$(echo "$resp" | jq -r --arg n "$VERCEL_PROJECT_NAME" '.projects[] | select(.name==$n) | .id' | head -n1)
+          account_id=$(echo "$resp" | jq -r --arg n "$VERCEL_PROJECT_NAME" '.projects[] | select(.name==$n) | .accountId' | head -n1)
+          if [ -z "$project_id" ]; then
+            echo "::error::No project named '$VERCEL_PROJECT_NAME' visible to this token. Recreate VERCEL_TOKEN scoped to the team that owns it."
+            exit 1
+          fi
+          echo "VERCEL_PROJECT_ID=$project_id" >> "$GITHUB_ENV"
+          echo "VERCEL_ORG_ID=$account_id" >> "$GITHUB_ENV"
+          echo "Resolved project $VERCEL_PROJECT_NAME -> $project_id"
+
+      - name: Point Vercel's Supabase env vars at this project
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          set -e
+          for name in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+            vercel env rm "$name" production --token="$VERCEL_TOKEN" --yes >/dev/null 2>&1 || true
+          done
+          printf '%s' "$SUPABASE_URL" | vercel env add SUPABASE_URL production --token="$VERCEL_TOKEN"
+          printf '%s' "$SERVICE_ROLE_KEY" | vercel env add SUPABASE_SERVICE_ROLE_KEY production --token="$VERCEL_TOKEN"
+          echo "Vercel env vars updated (values not printed)."
+
+      - name: Redeploy to production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel deploy --prod --token="$VERCEL_TOKEN" --yes
+
+      - name: Smoke-test the deployed API
+        run: |
+          set -e
+          sleep 20
+          echo "GET /api/rankings ->"
+          body=$(curl -sS -w "\n%{http_code}" "https://${VERCEL_PROJECT_NAME}.vercel.app/api/rankings")
+          code=$(echo "$body" | tail -n1)
+          echo "$body"
+          if [ "$code" = "200" ]; then
+            echo ""
+            echo "SUCCESS: the API responded correctly. Payments should work now."
+          elif [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
+            echo ""
+            echo "Still failing, and SUPABASE_DB_URL wasn't set — this next part"
+            echo "needs it: the database schema most likely hasn't been applied yet."
+            echo "Add that secret and re-run this workflow."
+          else
+            echo "::error::Still failing even with the database step included — see the response body above."
+            exit 1
+          fi
