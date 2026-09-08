@@ -74,3 +74,4 @@ Postgres (see the header of that file for how to run it).
   itself**, after the function is defined — setting it before
   `module.exports = ...` gets silently discarded and breaks Stripe
   signature verification.
+
